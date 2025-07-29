@@ -10,6 +10,27 @@ The project consists of three main stages:
 2. **Supervised Fine-Tuning (SFT)**: Initial training of language models on high-quality literary examples
 3. **GRPO Training**: Reinforcement learning optimization using Group Relative Policy Optimization
 
+## 📚 Datasets
+
+This project uses the following datasets, all available on HuggingFace:
+
+### Training Datasets
+- **Style Similarity Dataset**: [`VibrantVista/StyleScoredPairsDataset-HybridSplit-Final`](https://huggingface.co/datasets/VibrantVista/StyleScoredPairsDataset-HybridSplit-Final)
+  - Used for training sentence transformer reward models
+  - Contains pairs of text with style similarity scores
+
+- **SFT Dataset**: [`VibrantVista/SFT_storywriting_1500words`](https://huggingface.co/datasets/VibrantVista/SFT_storywriting_1500words)
+  - High-quality 1500-word story examples for supervised fine-tuning
+  - Curated examples in Mark Twain's literary style
+
+- **GRPO Dataset**: [`VibrantVista/GRPO_twain-prompts-4450`](https://huggingface.co/datasets/VibrantVista/GRPO_twain-prompts-4450)
+  - Writing prompts for GRPO training
+  - 4,450 diverse prompts for story generation
+
+- **Source Text Chunks**: [`VibrantVista/gutenberg-chunks`](https://huggingface.co/datasets/VibrantVista/gutenberg-chunks)
+  - Processed text chunks from Project Gutenberg classics
+  - Used for style analysis and dataset creation
+
 ## 📁 Project Structure
 
 ```
