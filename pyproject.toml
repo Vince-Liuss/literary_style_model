@@ -1,0 +1,39 @@
+[project]
+name = "model-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.7.0",
+    "bitsandbytes>=0.46.0",
+    "datasets>=3.6.0",
+    "deepspeed>=0.17.0",
+    "flash-attn",
+    "flashinfer-python==0.2.2",
+    "huggingface-hub[cli]>=0.32.4",
+    "jsonlines>=4.0.0",
+    "liger-kernel>=0.5.10",
+    "matplotlib>=3.10.3",
+    "nltk>=3.9.1",
+    "peft>=0.15.2",
+    "safetensors>=0.5.3",
+    "scikit-learn>=1.7.0",
+    "scipy>=1.15.3",
+    "seaborn>=0.13.2",
+    "sentence-transformers>=4.1.0",
+    "setuptools>=80.9.0",
+    "spacy>=3.8.7",
+    "tokenizers>=0.21.1",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+    "torchvision==0.21.0",
+    "transformers>=4.52.4",
+    "trl>=0.19.0",
+    "unstructured>=0.18.1",
+    "vllm==0.8.5",
+    "wandb>=0.20.1",
+]
+
+[tool.uv.sources]
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }
