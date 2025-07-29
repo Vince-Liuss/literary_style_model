@@ -21,11 +21,9 @@ This project uses the following datasets, all available on HuggingFace:
 
 - **SFT Dataset**: [`VibrantVista/SFT_storywriting_1500words`](https://huggingface.co/datasets/VibrantVista/SFT_storywriting_1500words)
   - High-quality 1500-word story examples for supervised fine-tuning
-  - Curated examples in Mark Twain's literary style
 
 - **GRPO Dataset**: [`VibrantVista/GRPO_twain-prompts-4450`](https://huggingface.co/datasets/VibrantVista/GRPO_twain-prompts-4450)
-  - Writing prompts for GRPO training
-  - 4,450 diverse prompts for story generation
+  - Writing prompts for GRPO training and sample style reference
 
 - **Source Text Chunks**: [`VibrantVista/gutenberg-chunks`](https://huggingface.co/datasets/VibrantVista/gutenberg-chunks)
   - Processed text chunks from Project Gutenberg classics
