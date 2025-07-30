@@ -627,14 +627,14 @@ def load_csv_to_models_data(csv_file_path):
 
 if __name__ == "__main__":
     config = ModelTestConfig(
-        reward_model_path="/bask/projects/l/leemg-llm-stories/models/finetune-style-all-mpnet-base-v2-final",
+        reward_model_path="your-style-reward-model-path",  # Path to your style reward model
         dataset_path="VibrantVista/GRPO_twain-prompts-4450",
     )
 
     tester = ModelTester(config)
 
     models_to_test = [
-        "" # Path to your model checkpoints,
+        "your-model-checkpoint-path",  # Path to your model checkpoints,
     ]
 
     # Efficient workflow - calculate everything once
