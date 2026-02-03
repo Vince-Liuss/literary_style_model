@@ -157,7 +157,7 @@ MIT License
 
 ## 📚 Citation
 If you use this code or methodology in your research, please cite our work:
-```
+```bibtex
 @misc{liu2025capturingclassicauthorialstyle,
       title={Capturing Classic Authorial Style in Long-Form Story Generation with GRPO Fine-Tuning}, 
       author={Jinlong Liu and Mohammed Bahja and Venelin Kovatchev and Mark Lee},
