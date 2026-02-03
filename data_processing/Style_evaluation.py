@@ -12,7 +12,7 @@ from typing import List, Dict, Optional, Any
 from textwrap import dedent
 
 from transformers import AutoTokenizer
-from datasets import load_from_disk
+from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
 
@@ -315,7 +315,23 @@ async def main():
     )
 
     logger.info("Loading Resources...")
-    full_dataset = load_from_disk(CONFIGS["dataset_path"])
+    full_dataset = {}
+    
+    for split_key in CONFIGS["test_splits"]:
+        author_name = split_key.split("/")[0] 
+        
+        logger.info(f"Loading dataset for: {author_name}")
+        
+        try:
+            ds = load_dataset(
+                "arrow", 
+                path=CONFIGS["dataset_path"],
+                data_dir=f"data/{author_name}",
+                split="test"
+            )
+            full_dataset[split_key] = ds
+        except Exception as e:
+            logger.error(f"Failed to load {split_key}: {e}")
     style_model = SentenceTransformer(
         CONFIGS["style_model_path"],
         trust_remote_code=True,

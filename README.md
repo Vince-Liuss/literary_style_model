@@ -139,7 +139,7 @@ accelerate launch Train/Multi_GRPOTrainer.py \
     --max_length 2200 \
     --beta 0.0005 \
     --max_grad_norm 0.35 \
-    --author_name "Twain, Mark" \
+    --author_name "Twain_Mark" \
     --log_wandb \
     --use_lora False \
     --loss_type "dr_grpo" \

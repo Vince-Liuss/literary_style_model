@@ -22,7 +22,7 @@ from peft import (
     TaskType,
 )
 from accelerate import PartialState
-from datasets import load_from_disk
+from datasets import load_dataset
 from trl import GRPOTrainer, GRPOConfig
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
@@ -54,7 +54,7 @@ class ScriptArguments:
     )
     log_wandb: bool = field(default=False, metadata={"help": "Enable WandB logging"})
     author_name: str = field(
-        default="Twain, Mark", metadata={"help": "Author name for dataset selection"}
+        default="Twain_Mark", metadata={"help": "Author name for dataset selection"}
     )
 
     # --- Training Hyperparameters ---
@@ -304,8 +304,11 @@ def train_with_grpo(args: ScriptArguments):
         }
 
     with distributed_state.main_process_first():
-        dataset = load_from_disk(args.dataset_path)
-        train_dataset = dataset[args.author_name]
+        dataset = load_dataset(
+            args.dataset_path, 
+            data_dir=f"data/{args.author_name}"
+        )
+        train_dataset = dataset["train"]
         train_dataset = train_dataset.map(format_for_grpo, batched=False)
 
     # 6. Trainer Setup (Full Settings Restored)
