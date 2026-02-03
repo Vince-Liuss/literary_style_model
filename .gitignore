@@ -4,12 +4,14 @@
 __pycache__/
 **/logs/
 **/runs/
+slurm*
 **/texts/
 **/**.db
 **/wandb
 clean_data/
 data/
 source_data/
+train/
 val/
 .vscode/
 **/Rag.py
@@ -17,4 +19,9 @@ test.py
 books/
 **/**.jsonl 
 hf_dataset_**.py
-
+/test/
+main.py
+data_processing/reward_dataset.py
+slides.md
+.github/
+uv.lock

@@ -1,0 +1,128 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+%setup
+    ROOTFS="${APPTAINER_ROOTFS:-${SINGULARITY_ROOTFS}}"
+    [ -n "${ROOTFS:-}" ] || (echo "ROOTFS not set" && exit 1)
+    mkdir -p "$ROOTFS/bask" "$ROOTFS/scratch" "$ROOTFS/local"
+
+%post -c /bin/bash
+    set -euo pipefail
+
+    # Ensure mount points exist
+    mkdir -p /bask /scratch /local
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+        tzdata ca-certificates curl git \
+        software-properties-common \
+        build-essential pkg-config \
+        ninja-build cmake \
+        libaio-dev \
+        gcc-10 g++-10 \
+        ccache \
+        jq
+    rm -rf /var/lib/apt/lists/*
+
+    # --- 1. Install uv (Self-contained binary) ---
+    # We download uv specifically for this build process to avoid host conflicts
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    mv /root/.local/bin/uv /usr/local/bin/uv
+    
+    # FORCE SYSTEM INSTALL: Ensures packages go to /usr/local/lib/python3.12/site-packages
+    export UV_SYSTEM_PYTHON=1
+
+    # Python 3.12
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update -y
+    apt-get install -y --no-install-recommends python3.12 python3.12-dev python3.12-venv
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+    update-alternatives --set python3 /usr/bin/python3.12
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+    
+    # Update base tools using system flag
+    uv pip install --system -U pip setuptools wheel
+
+    # CUDA env
+    export CUDA_HOME=/usr/local/cuda
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+
+    # Install Torch 2.9.0
+    uv pip install --system --no-cache-dir \
+      torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
+      --index-url https://download.pytorch.org/whl/cu128
+
+    python3 -c "import torch, torchvision; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+    export TORCH_CUDA_ARCH_LIST="9.0 9.0a"
+    export MAX_JOBS=100
+    
+    # --- 2. Clone vLLM to detect FlashInfer version ---
+    cd /opt
+    git clone https://github.com/vllm-project/vllm.git /opt/vllm
+    cd /opt/vllm
+    git fetch --tags
+    git checkout v0.11.2
+    git clean -xfd
+    git describe --tags --exact-match
+
+    # --- Build vLLM ---
+    cd /opt/vllm
+    python3 use_existing_torch.py
+
+    # FIX: Override the version explicitly so the "dirty" state
+    export SETUPTOOLS_SCM_PRETEND_VERSION=0.11.2
+
+    # Install build deps to system
+    uv pip install --system -r requirements/build.txt
+
+    # Install vLLM to system (no editable flag)
+    uv pip install --system --no-build-isolation .
+
+    cd /opt
+    rm -rf /opt/vllm
+
+    # --- 3. Full Stack Install (Force System) ---
+    uv pip install --system --no-cache-dir \
+        "accelerate>=1.7.0" \
+        "bitsandbytes>=0.46.0" \
+        "datasets>=3.6.0" \
+        "deepspeed>=0.17.0" \
+        "huggingface-hub[cli]>=0.32.4" \
+        "jsonlines>=4.0.0" \
+        "liger-kernel>=0.5.10" \
+        "matplotlib>=3.10.3" \
+        "nltk>=3.9.1" \
+        "peft>=0.15.2" \
+        "safetensors>=0.5.3" \
+        "scikit-learn>=1.7.0" \
+        "scipy>=1.15.3" \
+        "seaborn>=0.13.2" \
+        "sentence-transformers>=4.1.0" \
+        "spacy>=3.8.7" \
+        "tokenizers>=0.21.1" \
+        "transformers>=4.52.4,<5.0.0" \
+        "trl[vllm]==0.26.2" \
+        "wandb>=0.20.1"
+
+    python3 -m spacy download en_core_web_md
+
+    # Sanity checks
+    python3 -c "import torch, torchvision; from torchvision.ops import nms; print('nms ok')"
+    python3 -c "from transformers import pipeline; print('pipeline ok')"
+    python3 -c "import vllm, flashinfer; print('vllm', vllm.__version__); print('flashinfer ok')"
+
+%environment
+    export CUDA_HOME=/usr/local/cuda
+    export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+    export PYTHONNOUSERSITE=1
+    export TORCH_CUDA_ARCH_LIST="9.0 9.0a"
+    export VLLM_TORCH_COMPILE_LEVEL=0
+    export TORCH_COMPILE_DISABLE=1
+    export TORCH_DYNAMO_DISABLE=1
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+%runscript
+    exec python3 "$@"

@@ -4,30 +4,34 @@ import math
 import torch
 import numpy as np
 import logging
+import time
+import requests
+import sys
 import wandb
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Tuple, Optional
-
+from typing import List, Dict, Any, Union
+import spacy
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     HfArgumentParser,
-    pipeline,
-    Pipeline,
 )
 from peft import (
     LoraConfig,
     get_peft_model,
     TaskType,
 )
-from accelerate import Accelerator
-from datasets import load_dataset
+from accelerate import PartialState
+from datasets import load_from_disk
 from trl import GRPOTrainer, GRPOConfig
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
-from utils import get_content_reward_messages_openchat, ScoreProcessor
+from utils import get_content_reward_messages_openchat
 
-# Set up logging
+
+# Disable Tokenizers Parallelism to prevent deadlocks
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -38,270 +42,190 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScriptArguments:
-    """Arguments for GRPO training script for stylistic writing fine-tuning"""
-
-    model_path: str = field(
-        default="none",
-        metadata={
-            "help": "Path to the base pretrained model to fine-tune (e.g., 'meta-llama/Llama-2-7b-hf'). "
-            "Should be a model already trained for text generation or instruction following."
-        },
-    )
-    reward_model_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Path to reward model for evaluating generation quality. If None, uses reward functions "
-            "defined in code. Reward model should output scores for style, coherence, completeness, etc."
-        },
+    # --- Model & Data Configuration ---
+    model_path: str = field(default="none", metadata={"help": "Path to the base model"})
+    dataset_path: str = field(default="none", metadata={"help": "Path to the dataset"})
+    output_dir: str = field(
+        default="./grpo_output",
+        metadata={"help": "Directory to save checkpoints and logs"},
     )
     use_lora: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to use LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning. "
-            "Recommended for large models (>7B) or limited GPU memory. Reduces trainable parameters by ~99%."
-        },
+        default=False, metadata={"help": "Use LoRA for efficient fine-tuning"}
     )
-    dataset_path: str = field(
-        default="none",
-        metadata={
-            "help": "HuggingFace dataset path containing writing prompts for style training. "
-            "Dataset should have 'prompt' field with creative writing prompts or story beginnings."
-        },
+    log_wandb: bool = field(default=False, metadata={"help": "Enable WandB logging"})
+    author_name: str = field(
+        default="Twain, Mark", metadata={"help": "Author name for dataset selection"}
     )
-    max_length: int = field(
-        default=1500,
-        metadata={
-            "help": "Maximum completion length in tokens (not including prompt). Controls how long "
-            "generated stories/text can be. Typical range: 1000-2000 for creative writing."
-        },
-    )
+
+    # --- Training Hyperparameters ---
     learning_rate: float = field(
-        default=5e-6,
-        metadata={
-            "help": "Learning rate for optimizer. GRPO is sensitive to LR. Recommended: 1e-6 to 5e-6 for "
-            "large models (>7B), 5e-6 to 1e-5 for smaller models. Lower LR = more stable training."
-        },
+        default=1e-5,
+        metadata={"help": "Learning rate (Recommended: 1e-6 to 1e-5 for GRPO)"},
     )
-    num_iterations: int = field(
-        default=2,
-        metadata={
-            "help": "Number of GRPO training iterations/epochs. Each iteration processes the full dataset. "
-            "Typical range: 1-5. Monitor reward curves - stop when rewards plateau or start declining."
-        },
-    )
+    epochs: int = field(default=2, metadata={"help": "Number of training epochs"})
     batch_size: int = field(
-        default=1,
-        metadata={
-            "help": "Per-device mini-batch size for GRPO updates. Effective batch size = batch_size × "
-            "grad_acc_steps × num_gpus. Start with 1-2 for large models, 4-8 for smaller models."
-        },
+        default=1, metadata={"help": "Per-device training batch size"}
     )
     grad_acc_steps: int = field(
-        default=1,
-        metadata={
-            "help": "Gradient accumulation steps. Increases effective batch size without using more GPU memory. "
-            "Effective batch size = batch_size × grad_acc_steps. Recommended total: 8-32 for GRPO."
-        },
+        default=2, metadata={"help": "Gradient accumulation steps"}
     )
+    max_length: int = field(
+        default=1500, metadata={"help": "Max token length for generated completions"}
+    )
+
+    # --- GRPO Specific Settings ---
     num_generations: int = field(
-        default=8,
-        metadata={
-            "help": "Number of completions to generate per prompt for GRPO comparison. More generations = "
-            "better policy learning but slower training. Typical range: 4-16. Higher for complex tasks."
-        },
+        default=8, metadata={"help": "Number of generations per prompt (Group Size)"}
     )
     beta: float = field(
         default=0.1,
-        metadata={
-            "help": "KL divergence penalty coefficient. Controls trade-off between reward maximization and "
-            "staying close to reference model. Higher = more conservative. Range: 0.01-0.5. "
-            "Reduce if model becomes repetitive, increase if KL divergence gets too high (>1.0)."
-        },
-    )
-    epsilon: float = field(
-        default=0.2,
-        metadata={
-            "help": "PPO-style clipping parameter for policy updates. Controls how much the policy can change "
-            "per update. Lower = more conservative updates. Typical range: 0.1-0.3. Reduce if training unstable."
-        },
-    )
-    epsilon_high: float = field(
-        default=0.28,
-        metadata={
-            "help": "Upper bound for dual clipping in GRPO. Should be slightly higher than epsilon. "
-            "Helps prevent overly aggressive policy updates. Typical: epsilon + 0.05 to epsilon + 0.1."
-        },
-    )
-    max_grad_norm: float = field(
-        default=0.5,
-        metadata={
-            "help": "Maximum gradient norm for gradient clipping. Prevents exploding gradients and stabilizes "
-            "training. Lower values = more stable but potentially slower learning. Typical range: 0.5-2.0."
-        },
-    )
-    output_dir: str = field(
-        default="./grpo_output",
-        metadata={
-            "help": "Directory for saving model checkpoints, logs, and training results. Creates subdirectories "
-            "for different runs. Checkpoints saved based on save_steps parameter in GRPOConfig."
-        },
-    )
-    log_wandb: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to log training metrics to Weights & Biases. Logs reward scores, KL divergence, "
-            "loss curves, generated text samples, and training hyperparameters for experiment tracking."
-        },
+        metadata={"help": "KL penalty coefficient (Control drift from ref model)"},
     )
     loss_type: str = field(
         default="bnpo",
-        metadata={
-            "help": "Loss formulation to use. Options: 'grpo' (sequence-level, not recommended due to length bias), "
-            "'bnpo' (token-level normalization over local batch, default), 'dr_grpo' (global constant normalization). "
-            "BNPO is recommended for most use cases as it handles variable-length sequences better."
-        },
+        metadata={"help": "Loss function type: 'bnpo' (default) or 'grpo'"},
     )
-    scale_rewards: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to scale rewards by dividing by their standard deviation. If True, rewards are "
-            "normalized to unit variance. If False, no scaling applied. Dr. GRPO paper recommends False "
-            "to avoid question-level difficulty bias. Set to False for mathematical reasoning tasks."
-        },
+    scale_rewards: str = field(default="none", metadata={"help": "Normalize rewards"})
+    max_grad_norm: float = field(
+        default=0.1, metadata={"help": "Max gradient norm for clipping"}
     )
 
 
-def scale_similarity_score(similarity: float) -> float:
-    """Scale similarity score from 0 to 1 using mean references."""
-    CROSS_AUTHOR_MEAN = 0.048
-    SAME_AUTHOR_MEAN = 0.701
-    # Center around midpoint and scale
-    midpoint = (CROSS_AUTHOR_MEAN + SAME_AUTHOR_MEAN) / 2
-    scale_factor = 6.0 / (SAME_AUTHOR_MEAN - CROSS_AUTHOR_MEAN)
-
-    # Apply sigmoid: S(x) = 1 / (1 + e^(-x))
-    x = (similarity - midpoint) * scale_factor
-    scaled = 1.0 / (1.0 + np.exp(-x))
-
-    return np.clip(scaled, 0.05, 0.95)
+nlp = spacy.blank("en")
+THE_END_PATTERN = re.compile(r"THE\s?END[.!]*$", re.IGNORECASE)
 
 
 def calculate_completeness_reward(
     prompts: List[str], completions: List[str], **kwargs
-) -> torch.Tensor:
-    """
-    Calculates a nuanced reward that provides graded feedback for agentic training.
-    """
-    # Target for full reward. You can adjust this.
-    TARGET_WORD_COUNT = 1400
-    # Apply a 50% penalty to the score if the last sentence is incomplete.
-    COMPLETENESS_PENALTY = 0.5
-    # Word count below this threshold receives a 0 score to filter out noise.
+) -> List[float]:
+    LOWER_TARGET = 1200
+    UPPER_TARGET = 1500
     MINIMUM_THRESHOLD = 500
-
-    # This improved regex correctly identifies various sentence endings, including those
-    # with punctuation inside or outside of quotes (e.g., .", ".)
-    COMPLETE_PATTERN = re.compile(
-        r'\b\w+.*?((?:[.!?—]|\.{3})["\']?|["\'](?:[.!?—]|\.{3})|[!?]\.{3}["\']?)\s*$'
-    )
-
+    COMPLETENESS_PENALTY = 0.0
+    OVERLENGTH_PENALTY_START = 1600
     rewards = []
     for completion in completions:
-        text = completion.strip() if completion else ""
-        word_count = len(text.split())
-
-        # 1. Hard filter for trivially short or empty completions
+        if not completion or not completion.strip():
+            rewards.append(0.0)
+            continue
+        doc = nlp.make_doc(completion)
+        attr_array = doc.to_array([spacy.attrs.IS_PUNCT, spacy.attrs.IS_SPACE])
+        word_count = (attr_array.sum(axis=1) == 0).sum()
         if word_count < MINIMUM_THRESHOLD:
             rewards.append(0.0)
             continue
+        if word_count < LOWER_TARGET:
+            length_score = word_count / LOWER_TARGET
+        elif LOWER_TARGET <= word_count <= UPPER_TARGET:
+            length_score = 1.0
+        elif word_count <= OVERLENGTH_PENALTY_START:
+            length_score = 1.0
+        else:
+            length_score = max(
+                0.0,
+                1.0 - math.sqrt((word_count - OVERLENGTH_PENALTY_START) / UPPER_TARGET),
+            )
+        is_complete = bool(THE_END_PATTERN.search(completion.strip()))
+        if not is_complete:
+            length_score *= COMPLETENESS_PENALTY
+        rewards.append(float(length_score))
+    return rewards
 
-        # 2. Calculate the base score using a smooth square root curve
-        length_score = math.sqrt(min(1.0, word_count / TARGET_WORD_COUNT))
 
-        # 3. Determine if the completion is structurally sound
-        lines = text.splitlines()
-        last_line = lines[-1].strip() if lines else ""
+class RewardManager:
+    """
+    Manages reward models by loading them on the specific local GPU.
+    This bypasses FSDP wrapping entirely to prevent 'SentenceTransformer' sharding errors.
+    """
 
-        # The logic is corrected to allow single-word sentences (e.g., "Yes.")
-        is_structurally_complete = len(last_line) >= 2 and COMPLETE_PATTERN.search(
-            last_line
+    def __init__(self, args, device):
+        self.device = device
+        self.args = args
+        self.style_model = None
+
+    def load_models(self):
+        logger.info(f"Loading Reward Models on Isolated Device: {self.device}")
+
+        # 1. Load Sentence Transformer (Style)
+        self.style_model = SentenceTransformer(
+            "VibrantVista/gte-large-en-v1.5-stylejudge",
+            trust_remote_code=True,
+            device=str(self.device),
         )
+        self.style_model.eval()
 
-        # 4. Apply penalty if structurally incomplete
-        final_score = length_score
-        if not is_structurally_complete:
-            final_score *= COMPLETENESS_PENALTY
+    def get_content_reward(self, prompts: Union[List[Dict], Any]) -> int:
+        """
+        Requests a score (0-9) from the local reward scoring server.
 
-        rewards.append(final_score)
+        BEHAVIOR:
+        - Silent: No print logs or error messages.
+        - Infinite: Retries forever until a valid score 0-9 is obtained.
+        - Safety: Includes a 1s sleep to prevent CPU overheating during outages.
+        """
 
-    return torch.tensor(rewards, dtype=torch.float32)
+        score_regex = r"^[0-9]$"
+
+        payload = {
+            "model": "openchat/openchat-3.5-0106",
+            "messages": prompts,
+            "max_tokens": 3,
+            "temperature": 0.0,
+            "stop": ["<|end_of_turn|>"],
+            "structured_outputs": {"regex": score_regex},
+        }
+
+        api_url = "http://localhost:8000/v1/chat/completions"
+
+        while True:
+            try:
+                response = requests.post(api_url, json=payload, timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "choices" in data and len(data["choices"]) > 0:
+                        content = data["choices"][0]["message"]["content"].strip()
+                        if len(content) == 1 and content.isdigit():
+                            return int(content)
+
+                # If 500/503 error, wait and retry
+                elif response.status_code >= 500:
+                    time.sleep(1)
+                    continue
+                elif response.status_code == 400:
+                    logger.warning("Reward server returned 400 Bad Request.")
+                    sys.exit(1)
+
+            except Exception:
+                pass
+
+            # Mandatory wait to prevent CPU spamming while the server is down
+            time.sleep(1)
 
 
-def setup_score_model(args: ScriptArguments) -> Tuple[Pipeline, AutoTokenizer]:
-    model_name = "openchat/openchat-3.5-0106"
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map="auto",
-    )
-    model.eval()
+def train_with_grpo(args: ScriptArguments):
+    # 1. Setup Distributed State
+    distributed_state = PartialState()
+    device = distributed_state.device
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, padding_side="left", trust_remote_code=True
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = tokenizer.pad_token_id
+    reward_manager = RewardManager(args, device)
+    reward_manager.load_models()
 
-    return (
-        pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            batch_size=args.batch_size,
-        ),
-        tokenizer,
-    )
+    clean_name = args.author_name.replace(", ", "_").replace("'", "")
+    folder_name = f"{clean_name}-{args.beta}"
+    args.output_dir = os.path.join(args.output_dir, folder_name)
+    if args.log_wandb:
+        if distributed_state.is_main_process:
+            wandb.init(
+                project="author-style-agent",
+                name=f"{clean_name}-{args.beta}",
+                config=vars(args),
+            )
 
-
-def train_with_grpo(args: ScriptArguments) -> str:
-    """Main GRPO training function using TRL's GRPO trainer"""
-
-    style_reward_model = SentenceTransformer(args.reward_model_path)
-    content_reward_pipe, content_tokenizer = setup_score_model(args)
-    score_processor = ScoreProcessor(content_tokenizer)
-
-    accelerator = Accelerator(
-        log_with="wandb" if args.log_wandb else None,
-    )
-
-    if accelerator.is_main_process:
-        run_name = (
-            f"grpo-{args.model_path.split('/')[-1]}-{args.beta}-{args.learning_rate}"
-        )
-        accelerator.init_trackers(
-            project_name="author-style-agent_multiGPU",
-            config={**vars(args), "model": args.model_path},
-            init_kwargs={"wandb": {"name": run_name, "tags": [args.loss_type]}},
-        )
-
-    # Load model and tokenizer
-    logger.info("Loading model and tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    logger.info("Loading Tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, fix_mistral_regex=True)
+    tokenizer.padding_side = "left"
 
     if args.use_lora:
-        logger.info("Applying LoRA configuration")
         lora_config = LoraConfig(
             r=32,
             lora_alpha=256,
@@ -319,187 +243,152 @@ def train_with_grpo(args: ScriptArguments) -> str:
             task_type=TaskType.CAUSAL_LM,
         )
         model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
 
-    # Load dataset
-    with accelerator.main_process_first():
-        logger.info("Loading dataset")
-        dataset = load_dataset(args.dataset_path)
+    # 4. Define Reward Functions
+    def style_reward_func(prompts, completions, **kwargs):
+        target_samples = kwargs.get("sample_text", [""] * len(completions))
+        factor = len(completions) // len(target_samples) if len(target_samples) else 1
+        target_samples = [t for t in target_samples for _ in range(factor)]
 
-    ratio = (
-        args.batch_size * args.grad_acc_steps * accelerator.num_processes
-    ) / args.num_generations
+        c_emb = reward_manager.style_model.encode(
+            completions,
+            batch_size=8,
+            show_progress_bar=False,
+        )
+        t_emb = reward_manager.style_model.encode(
+            target_samples,
+            batch_size=8,
+            show_progress_bar=False,
+        )
 
-    save_setps = len(dataset["train"]) // (ratio * 4)
+        sims = cos_sim(c_emb, t_emb).diagonal().cpu().numpy()
+        return [float(s) for s in sims]
 
-    # Configure GRPO
-    grpo_config = GRPOConfig(
-        overwrite_output_dir=True,
-        bf16=True,
-        seed=42,
-        data_seed=42,
-        ds3_gather_for_generation=True,
-        output_dir=args.output_dir,
-        num_train_epochs=args.num_iterations,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_acc_steps,
-        num_generations=args.num_generations,
-        max_prompt_length=256,
-        max_completion_length=args.max_length,
-        learning_rate=args.learning_rate,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.1,
-        optim="adamw_torch_fused",
-        adam_beta1=0.9,
-        adam_beta2=0.99,
-        weight_decay=0.01,
-        max_grad_norm=args.max_grad_norm,
-        beta=args.beta,
-        epsilon=args.epsilon,
-        epsilon_high=args.epsilon_high,
-        loss_type=args.loss_type,
-        reward_weights=[0.6, 0.3, 0.1],
-        scale_rewards=args.scale_rewards,
-        mask_truncated_completions=True,
-        sync_ref_model=False,
-        ref_model_mixup_alpha=0.6,
-        ref_model_sync_steps=128,
-        remove_unused_columns=False,
-        label_names=[],
-        logging_steps=1,
-        save_strategy="steps",
-        save_steps=save_setps,
-        eval_strategy="no",
-        save_only_model=True,
-        run_name=(
-            f"grpo-{args.model_path.split('/')[-1]}"
-            if accelerator.is_main_process
-            else None
-        ),
-        report_to="wandb" if accelerator.is_main_process and args.log_wandb else "none",
-        save_total_limit=4,
-        log_completions=True,
-        num_completions_to_print=0,
-        use_liger_kernel=True,
-        generation_kwargs={
-            "temperature": 0.9,
-            "repetition_penalty": 1.05,
-            "top_k": 50,
-            "top_p": 0.95,
-            "min_p": 0.02,
-            "max_new_tokens": 1600,
-            "min_new_tokens": 1400,
-            "do_sample": True,
-        },
-    )
-
-    def style_reward(
+    def content_reward_func(
         prompts: List[str], completions: List[str], **kwargs
-    ) -> List[float]:
+    ) -> torch.Tensor:
 
-        target_samples = kwargs["sample_text"]
-
-        # Prepare text pairs
-        completion_texts = []
-        sample_texts = []
-
-        for i, completion in enumerate(completions):
-            sample_idx = i % len(target_samples)
-            sample_text = target_samples[sample_idx]
-
-            completion_texts.append(completion)
-            sample_texts.append(sample_text)
-
-        # Compute embeddings
-        completion_embeddings = style_reward_model.encode(
-            completion_texts, show_progress_bar=False, batch_size=args.batch_size
+        is_expanded = len(prompts) == len(completions)
+        generations_per_prompt = (
+            len(completions) // len(prompts) if not is_expanded else 1
         )
-        sample_embeddings = style_reward_model.encode(
-            sample_texts, show_progress_bar=False, batch_size=args.batch_size
-        )
-
-        # Calculate cosine similarities using sentence transformers
-        similarities = (
-            cos_sim(completion_embeddings, sample_embeddings).diagonal().numpy()
-        )
-
-        # Scale similarities to 0-1 range
-        style_rewards = [scale_similarity_score(sim) for sim in similarities]
-
-        return style_rewards
-
-    def content_reward(
-        prompts: List[str], completions: List[str], **kwargs
-    ) -> List[float]:
-        # Access your dataset completion column - update column name as needed
         formatted_prompts = []
-        for completion in completions:
-            if not completion or not completion.strip():
+        for i, completion in enumerate(completions):
+            if not completion or not str(completion).strip():
                 formatted_prompts.append("")
                 continue
 
-            # Get messages and apply chat template
-            messages = get_content_reward_messages_openchat(completion)
-            formatted_prompt = content_tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            formatted_prompts.append(formatted_prompt)
+            if is_expanded:
+                current_prompt = prompts[i]
+            else:
+                current_prompt = prompts[i // generations_per_prompt]
+            messages = get_content_reward_messages_openchat(current_prompt, completion)
+            formatted_prompts.append(messages)
 
-        # Batch process
-        responses = content_reward_pipe(
-            formatted_prompts,
-            max_new_tokens=1,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            return_full_text=False,
-            logits_processor=[score_processor],
-            renormalize_logits=True,
-        )
-
-        # Extract scores
         rewards = []
-        for i, response in enumerate(responses):
-            # logger.info(f"Response: {response}")
-            if not formatted_prompts[i]:
-                rewards.append(0.0)
-                continue
-
-            assistant_response = response[0]["generated_text"]
-            score = int(assistant_response) / 4.0
+        for prompt in formatted_prompts:
+            score = reward_manager.get_content_reward(prompt)
+            score = float(score) / 10.0
             rewards.append(score)
 
         return torch.tensor(rewards, dtype=torch.float32)
 
-    # Initialize GRPO trainer
-    logger.info("Initializing GRPO trainer")
-    grpo_trainer = GRPOTrainer(
-        model=model,
+    # 5. Dataset Setup
+    def format_for_grpo(example):
+        messages = [{"role": "user", "content": example["prompt"]}]
+        return {
+            "prompt": tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            ),
+            "sample_text": example["sample_text"],
+        }
+
+    with distributed_state.main_process_first():
+        dataset = load_from_disk(args.dataset_path)
+        train_dataset = dataset[args.author_name]
+        train_dataset = train_dataset.map(format_for_grpo, batched=False)
+
+    # 6. Trainer Setup (Full Settings Restored)
+    grpo_config = GRPOConfig(
+        model_init_kwargs={"dtype": torch.bfloat16},
+        overwrite_output_dir=True,
+        bf16=True,
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_acc_steps,
+        learning_rate=args.learning_rate,
+        ds3_gather_for_generation=True,
+        lr_scheduler_type="cosine_with_min_lr",
+        lr_scheduler_kwargs={"min_lr_rate": 0.2},
+        warmup_ratio=0.03,
+        num_generations=args.num_generations,
+        max_completion_length=args.max_length,
+        max_grad_norm=args.max_grad_norm,
+        beta=args.beta,
+        loss_type=args.loss_type,
+        optim="adamw_torch_fused",
+        weight_decay=0.01,
+        scale_rewards=args.scale_rewards,
+        logging_steps=1,
+        reward_weights=[0.6, 0.3, 0.1],
+        save_strategy="steps",
+        save_steps=25,
+        save_total_limit=1,
+        report_to="wandb" if args.log_wandb else "none",
+        log_completions=True,
+        save_only_model=True,
+        mask_truncated_completions=False,
+        use_liger_kernel=False,
+        importance_sampling_level="sequence",
+        use_bias_correction_kl=False,
+        top_entropy_quantile=1.0,
+        num_completions_to_print=0,
+        generation_kwargs={
+            "temperature": 0.9,
+            "repetition_penalty": 1.05,
+            "top_p": 0.95,
+            "min_p": 0.05,
+            "max_tokens": args.max_length,
+        },
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_gpu_memory_utilization=0.15 if args.beta != 0.0 else 0.3,
+        vllm_max_model_length=4096,
+        vllm_tensor_parallel_size=4,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode="token_truncate",
+        ddp_timeout=3600,
+    )
+
+    trainer = GRPOTrainer(
+        model=args.model_path,
         processing_class=tokenizer,
         args=grpo_config,
-        train_dataset=dataset["train"],
+        train_dataset=train_dataset,
         reward_funcs=[
-            style_reward,
-            content_reward,
+            style_reward_func,
+            content_reward_func,
             calculate_completeness_reward,
         ],
     )
 
-    # Start training
     logger.info("Starting GRPO training")
-    grpo_trainer.train()
+    trainer.train()
 
-    # Finish W&B run
+    # 7. Robust Saving
+    logger.info("Saving Model & Tokenizer...")
+    trainer.save_model(args.output_dir)
+
+    if distributed_state.is_main_process:
+        tokenizer.save_pretrained(args.output_dir)
+        logger.info(f"Training Complete. Model saved to {args.output_dir}")
+
     if args.log_wandb:
-        accelerator.end_training()
+        wandb.finish()
 
 
 if __name__ == "__main__":
-    # Parse arguments
     parser = HfArgumentParser(ScriptArguments)
     args = parser.parse_args_into_dataclasses()[0]
-
-    # Run GRPO training
     train_with_grpo(args)

@@ -1,52 +1,31 @@
-import copy
 import os
 import re
 import json
+import spacy
+import warnings
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
 from datasets import Dataset, DatasetDict
 from unstructured.cleaners.core import clean_extra_whitespace
-from unstructured.partition.text import partition_text
-import nltk
+
+# Regex optimizations: Compiled at module level to avoid runtime overhead
+ZW_CHARS_RE = re.compile(r"[\u200B\u200C\u200D\u2060\uFEFF]")
+BIDI_RE = re.compile(r"[\u200E\u200F\u061C]")
+NBSP_RE = re.compile(r"[\u00A0\u202F\u2007]")
+SOFT_HYPHEN_RE = re.compile(r"\u00AD")
+CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
+DOUBLE_NEWLINE_PATTERN = re.compile(r"\n\s*\n+")
+SPACE_PATTERN = re.compile(r"[ \t]+")
 
 
-def chunk_paragraphs_multiple_sizes(
-    paragraphs, chunk_sizes=[500, 1000, 1500, 2000, 2500, 3000]
-):
-    """Create chunks for multiple word count limits"""
-    results = {}
-
-    for max_words in chunk_sizes:
-        chunks = []
-        current_chunk = []
-        current_count = 0
-
-        for para in paragraphs:
-            para_text = para.text if hasattr(para, "text") else para
-            tokens = nltk.word_tokenize(para_text)
-            token_count = len(tokens)
-
-            if current_count + token_count > max_words and current_chunk:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = []
-                current_count = 0
-
-            current_chunk.append(para_text)
-            current_count += token_count
-
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-
-        results[max_words] = chunks
-
-    return results
-
-
-def clean_title(title):
-    """Clean title string by removing chapter/part references"""
+def clean_title(title: str) -> str:
+    """Sanitizes titles for file/label naming."""
+    if not title:
+        return "unknown_title"
     title = re.sub(r"[\r\n]+", " ", title)
     title = re.sub(r"\s+", " ", title).strip()
+    # Strip Gutenberg-specific metadata (Chapters X-Y, Part Z)
     title = re.sub(
         r",\s*Chapters?\s+\d+\s*(?:to|-)\s*(?:\d+|the Last)",
         "",
@@ -59,219 +38,301 @@ def clean_title(title):
 
 
 class GutenbergCleaner:
-    def __init__(self):
-        self.cleaning_functions = [
-            self.normalize_quotes,
-            self.clean_special_chars,
-            self.remove_notes,
-            self.format_chapter_headings,
-            self.remove_chapter_headers,
-            self.remove_page_numbers,
-            self.handle_illustrations,
-            self.remove_urls,
-            self.clean_gutenberg_content,
-        ]
+    """
+    High-performance regex cleaner.
+    Order of operations is tuned to remove largest chunks of noise first.
+    """
 
-    def clean(self, text):
-        for func in self.cleaning_functions:
-            text = func(text)
-        return text.strip("_")
+    CURLY_QUOTES = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"}
 
-    @staticmethod
-    def normalize_quotes(text):
-        return (
-            text.replace('"', '"').replace('"', '"').replace(""", "'").replace(""", "'")
-        )
+    # Compile heavy patterns once
+    FOOTNOTE_BLOCK = re.compile(
+        r"^\s*\[\d+\]\s+(?:\w+\s+){3,}.*?(?=\n\s*(?:\[|{|\d|$))",
+        re.MULTILINE | re.DOTALL,
+    )
+    SIDENOTE = re.compile(
+        r"\[(?:Side[\s-]?note|Sidenote)\s*:\s*[^\]]+\]", re.IGNORECASE
+    )
+    FOOTNOTE_MARKER = re.compile(r"\[\d+\]|\{\d+\}|\(\s*\d+\s*\)")
+    CURLY_CITATION = re.compile(r"\{(?:[^{}]|(?:\{[^{}]*\}))*\}", re.DOTALL)
+    TRANS_NOTE = re.compile(r"^\s*-{5,}\s*\*?.+?-{5,}\s*$", re.MULTILINE | re.DOTALL)
+    SEPARATOR = re.compile(r"^\s*\*(?:\s{2,}\*)+\s*$|^\s*[*\-~#]{5,}\s*$", re.MULTILINE)
+    EMPHASIS = re.compile(r"[_*]+(\w+)[_*]+")
+    ILLUSTRATION = re.compile(r"\[Illustration[^\]]*\]", re.IGNORECASE)
+    CHAPTER_HEADER = re.compile(
+        r"^\s*(chapter|Chapter)\s*(\d+|I{1,3}|IV|IX|V?I{0,3})\s*.*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    PAGE_NUM = re.compile(r"^\s*\d+\s*$|^\s*\[pg\s*\d+\]", re.MULTILINE | re.IGNORECASE)
+    URL_PATTERN = re.compile(r"https?://\S+|www\.\S+")
 
-    @staticmethod
-    def clean_special_chars(text):
-        text = re.sub(r"[_*]+", "", text)
-        text = re.sub(r"--+", "—", text)
-        text = re.sub(r"[❦]", "", text)
-        text = re.sub(r"[^\w\s.,!?;:()-]", "", text)
-        return text
+    def clean(self, text: str) -> str:
+        if not text:
+            return ""
 
-    @staticmethod
-    def remove_notes(text):
-        text = re.sub(r"\[[^\]]+\]", "", text)
-        text = re.sub(r"\(\s*\d+\s*\)", "", text)
-        return text
+        # 1. Cheap string replacements first
+        text = text.replace("\xa0", " ").replace("\u200b", " ")
 
-    @staticmethod
-    def format_chapter_headings(text):
-        pattern = r"^(chapter\s+[\divxlc]+\s*\.?)(.*)$"
-        text = re.sub(pattern, r"## \1\n\n\2", text, flags=re.MULTILINE | re.IGNORECASE)
-        return text
+        # 2. Heavy Regex (Structure Removal)
+        text = self.FOOTNOTE_BLOCK.sub("", text)
+        text = self.SIDENOTE.sub("", text)
+        text = self.FOOTNOTE_MARKER.sub("", text)
+        text = self.CURLY_CITATION.sub("", text)
+        text = self.TRANS_NOTE.sub("", text)
+        text = self.SEPARATOR.sub("", text)
 
-    @staticmethod
-    def remove_chapter_headers(text):
-        text = re.sub(
-            r"^\s*(chapter|Chapter)\s*(\d+|I{1,3}|IV|IX|V?I{0,3})\s*.*$",
-            "",
-            text,
-            flags=re.MULTILINE | re.IGNORECASE,
-        )
+        # 3. Formatting Normalization
+        for old, new in self.CURLY_QUOTES.items():
+            text = text.replace(old, new)
+        text = text.replace("--", "—")
+        text = self.EMPHASIS.sub(r"\1", text)
+        text = re.sub(r"[❦†‡※]", "", text)
+        text = re.sub(r"^\s*[\*_]+\s*$", "", text, flags=re.MULTILINE)
+
+        # 4. Metadata Stripping
+        text = self.ILLUSTRATION.sub("", text)
+        text = re.sub(r"(?is)illustration:.*?(?=\n\n|\Z)", "", text)
+        text = re.sub(r"\{Illustration:.*?\}", "", text, flags=re.DOTALL)
+        text = self.CHAPTER_HEADER.sub("", text)
         text = re.sub(
             r"^.*\b(chapter|Chapter)\b.*$", "", text, flags=re.MULTILINE | re.IGNORECASE
         )
-        return text
+        text = self.PAGE_NUM.sub("", text)
+        text = self.URL_PATTERN.sub("", text)
+        text = self._remove_toc(text)
+
+        # 5. Final Whitespace Collapse
+        text = DOUBLE_NEWLINE_PATTERN.sub("\n\n", text)
+        text = SPACE_PATTERN.sub(" ", text)
+        return text.strip("_").strip()
 
     @staticmethod
-    def remove_page_numbers(text):
-        text = re.sub(r"^\s*\d+\s*$", "", text, flags=re.MULTILINE)
-        text = re.sub(r"\[pg\s*\d+\]", "", text, flags=re.IGNORECASE)
-        return text
-
-    @staticmethod
-    def handle_illustrations(text):
-        text = re.sub(
-            r"^\s*illustration\s*$", "", text, flags=re.MULTILINE | re.IGNORECASE
-        )
-        text = re.sub(
-            r"\[illustration(?:\:|\s).*?\]", "", text, flags=re.DOTALL | re.IGNORECASE
-        )
-        text = re.sub(r"(?is)illustration:.*?(?=\n\n|\Z)", "", text)
-        text = re.sub(r"\{Illustration:.*?\}", "", text, flags=re.DOTALL)
-        text = re.sub(r"\n\s*\n", "\n\n", text)
-        return text
-
-    @staticmethod
-    def clean_gutenberg_content(text):
+    def _remove_toc(text: str) -> str:
+        """Heuristic filter to strip Table of Contents lines."""
         lines = text.split("\n")
         cleaned_lines = []
-        skip_section = False
-
+        skip = False
         for line in lines:
+            # Trigger skip on TOC headers
             if re.match(
                 r"^(Contents|VOLUME|CHAPTER|List of Illustrations)",
                 line.strip(),
                 re.IGNORECASE,
             ):
-                skip_section = True
+                skip = True
+            # Stop skipping when we hit body text (non-numeric/header line)
             elif line.strip() and not re.match(r"^\d+\.?\s", line.strip()):
-                skip_section = False
+                skip = False
 
-            if not skip_section and not re.match(
+            if not skip and not re.match(
                 r"^(VOLUME|CHAPTER)", line.strip(), re.IGNORECASE
             ):
                 cleaned_lines.append(line)
-
         return "\n".join(cleaned_lines)
-
-    @staticmethod
-    def remove_urls(text):
-        url_pattern = re.compile(r"https?://\S+|www\.\S+")
-        return url_pattern.sub("", text)
 
 
 class DatasetBuilder:
+    """
+    Pipeline: Disk Read -> CPU Clean -> GPU Tokenize -> CPU Chunk -> Disk Save.
+    Optimized to minimize cross-device transfer and redundant computation.
+    """
+
     def __init__(self):
         self.cleaner = GutenbergCleaner()
-        self.chunk_sizes = [500, 1000, 1500, 2000, 2500, 3000]
 
-    def build_dataset(
-        self,
-        metadata_file: str,
-        data_folder: str,
-        dataset_name: str,
-        push_to_hub: bool = True,
-    ):
-        """Build HuggingFace dataset with different chunk size splits"""
+        # GPU Activation
+        if spacy.prefer_gpu():
+            print("🚀 GPU Acceleration: ENABLED")
+            try:
+                spacy.require_gpu()  # Force allocation
+            except:
+                pass
+        else:
+            print("⚠️  GPU Acceleration: DISABLED (Running on CPU)")
 
-        # Load metadata
-        with open(metadata_file, "r") as f:
-            metadata = json.load(f)
+        try:
+            print("⏳ Loading SpaCy model...")
+            # Disable unused pipes to save VRAM and improve speed (30-50% faster)
+            self.nlp = spacy.load(
+                "en_core_web_md",
+                disable=["ner", "tagger", "lemmatizer", "attribute_ruler"],
+            )
+            self.nlp.max_length = 10000000  # Support full books
+            print("✅ SpaCy loaded.")
+        except IOError:
+            raise RuntimeError("Run `python -m spacy download en_core_web_md` first.")
 
-        # Store data for each split with separate numbering
-        splits_data = {str(size): [] for size in self.chunk_sizes}
-        # Separate unique_label_dict for each chunk size
-        unique_label_dicts = {str(size): {} for size in self.chunk_sizes}
-
-        # Process each book
-        for book_metadata in tqdm(metadata, desc="Processing books"):
-            gutenberg_id = book_metadata["gutenberg_id"]
-            author = book_metadata["author"]
-            title = book_metadata["title"]
-            subject = book_metadata["subject"]
-            filename = book_metadata["filename"]
-            file_path = os.path.join(data_folder, filename)
-
-            if not os.path.exists(file_path):
+    def _book_stream(self, books_data, data_folder):
+        """
+        Generator for nlp.pipe.
+        Handles IO and Cleaning parallel to GPU processing in the main loop.
+        """
+        for book in books_data:
+            path = os.path.join(data_folder, book["filename"])
+            if not os.path.exists(path):
                 continue
 
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as book_file:
-                book_text = book_file.read()
-                cleaned_text = self.cleaner.clean(book_text)
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    raw = f.read()
 
-                # Skip if text is too short
-                if len(cleaned_text.split()) < 100:
-                    continue
+                # Clean text immediately after read
+                cleaned = self.cleaner.clean(raw)
 
-                # Partition text into elements
-                elements = partition_text(text=cleaned_text)
+                # Filter tiny files
+                if len(cleaned) < 2000:
+                    continue  # ~500 words
 
-                # Create chunks for all sizes
-                chunks_dict = chunk_paragraphs_multiple_sizes(
-                    elements, self.chunk_sizes
-                )
+                yield cleaned, book
+            except Exception:
+                continue
 
-                # Process title
-                processed_title = clean_title(title)
+    def precompute_sentences(self, doc):
+        """
+        CRITICAL OPTIMIZATION:
+        Iterates the heavy SpaCy Doc ONCE. Extracts text and valid word counts.
+        Returns lightweight Python objects for the multi-pass chunker.
+        """
+        sents_data = []
 
-                # Store chunks for each size using original numbering logic
-                for chunk_size, chunks in chunks_dict.items():
-                    # Build unique key as Author_cleanedTitle (same as original)
-                    book_key = f"{author}_{processed_title}"
-                    if book_key not in unique_label_dicts[str(chunk_size)]:
-                        unique_label_dicts[str(chunk_size)][book_key] = 1
+        for sent in doc.sents:
+            text = sent.text.strip()
+            if not text:
+                continue
 
-                    for chunk in chunks:
-                        if len(chunk.split()) < 50:  # Skip very short chunks
-                            continue
+            # Strict word count: exclude punctuation and whitespace tokens
+            # Accessing .is_punct is a C-level call, doing this once per token is vital.
+            count = sum(1 for t in sent if not t.is_punct and not t.is_space)
 
-                        # Assign sequential label for this (author, processed_title) pair (same as original)
-                        chunk_label = f"{author}_[{processed_title}]_{unique_label_dicts[str(chunk_size)][book_key]}"
-                        unique_label_dicts[str(chunk_size)][book_key] += 1
+            if count > 0:
+                sents_data.append((text, count))
 
-                        chunk_data = {
-                            "chunk_label": chunk_label,
-                            "chunk_text": clean_extra_whitespace(chunk),
-                            "gutenberg_id": gutenberg_id,
-                            "author": author,
-                            "title": processed_title,
-                            "subject": subject,
-                            "chunk_size": chunk_size,
-                            "chunk_index": unique_label_dicts[str(chunk_size)][book_key]
-                            - 1,
+        return sents_data
+
+    def create_chunks_from_precomputed(self, sents_data, max_words):
+        """
+        Generates chunks using pre-calculated metadata.
+        Pure Python logic, extremely fast.
+        """
+        chunks = []
+        buffer_text = []
+        curr_count = 0
+
+        for text, count in sents_data:
+            if curr_count + count > max_words and buffer_text:
+                # Flush buffer
+                chunks.append(" ".join(buffer_text))
+                buffer_text = [text]
+                curr_count = count
+            else:
+                buffer_text.append(text)
+                curr_count += count
+
+        # Flush remaining
+        if buffer_text:
+            chunks.append(" ".join(buffer_text))
+
+        return chunks
+
+    def build(self, metadata_file, data_folder, hf_output_path):
+        meta_path = Path(metadata_file)
+        if not meta_path.exists():
+            return
+
+        Path(hf_output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        with open(meta_path, "r") as f:
+            books_data = json.load(f).get("books", [])
+
+        print(f"\n📋 Processing {len(books_data)} books...")
+
+        TARGET_SIZES = [500, 1000, 1500, 2000, 2500, 3000]
+
+        # Data structures
+        split_buffer = defaultdict(list)
+        chunk_counters = defaultdict(lambda: defaultdict(int))
+        total_chunks = defaultdict(int)
+        files_processed = 0
+
+        # Stream processing
+        # batch_size=4 is conservative for 16GB VRAM with large books. Increase if VRAM allows.
+        # n_process=1 is safe; multiprocessing with GPU requires 'spawn' context (complex).
+        stream = self.nlp.pipe(
+            self._book_stream(books_data, data_folder), as_tuples=True, batch_size=4
+        )
+
+        pbar = tqdm(total=len(books_data), desc="Processing")
+
+        for doc, meta in stream:
+            # 1. One-time expensive pass over Doc
+            sents_data = self.precompute_sentences(doc)
+
+            if not sents_data:
+                pbar.update(1)
+                continue
+
+            gid = meta["gutenberg_id"]
+            auth = meta["author"]
+            # Clean title once
+            title = clean_title(meta["title"])
+            subj = meta["subjects"][0] if meta["subjects"] else "unknown"
+
+            # 2. Multi-pass chunking (Fast on precomputed data)
+            for size in TARGET_SIZES:
+                chunks = self.create_chunks_from_precomputed(sents_data, size)
+
+                for txt in chunks:
+                    # Final whitespace polish
+                    txt = clean_extra_whitespace(txt)
+                    if not txt:
+                        continue
+
+                    chunk_counters[gid][size] += 1
+                    total_chunks[size] += 1
+
+                    label = f"{auth}_[{title}]_{size}_{chunk_counters[gid][size]}"
+
+                    # Store in memory buffer
+                    split_buffer[str(size)].append(
+                        {
+                            "gutenberg_id": gid,
+                            "author": auth,
+                            "title": title,
+                            "subjects": subj,
+                            "chunk_label": label,
+                            "chunk_text": txt,
+                            "target_length": size,
                         }
-                        splits_data[str(chunk_size)].append(chunk_data)
+                    )
 
-        # Create HuggingFace DatasetDict
-        dataset_dict = {}
-        for chunk_size, data in splits_data.items():
-            if data:  # Only create split if data exists
-                dataset_dict[chunk_size] = Dataset.from_list(data)
-                print(f"Split '{chunk_size}': {len(data)} chunks")
+            files_processed += 1
+            pbar.update(1)
 
-        hf_dataset = DatasetDict(dataset_dict)
+            # Update progress bar with live stats
+            stats = " | ".join([f"Sz{k}:{v}" for k, v in total_chunks.items()])
+            pbar.set_postfix_str(stats)
 
-        # Push to hub if requested
-        if push_to_hub:
-            hf_dataset.push_to_hub(dataset_name)
-            print(f"Dataset pushed to HuggingFace Hub: {dataset_name}")
+        pbar.close()
 
-        return hf_dataset
+        # --- Saving ---
+        print(f"\n✅ Processed {files_processed} books.")
+        print(f"🏗️  Building Hugging Face DatasetDict...")
+
+        hf_splits = {k: Dataset.from_list(v) for k, v in split_buffer.items()}
+        final_ds = DatasetDict(hf_splits)
+
+        print(f"💾 Saving to: {hf_output_path}")
+        final_ds.save_to_disk(hf_output_path)
+        print("✅ Done.")
 
 
 if __name__ == "__main__":
-    builder = DatasetBuilder()
-
     # Configuration
-    config = {
-        "metadata_file": "../books/metadata.json",
-        "data_folder": "../books",
-        "dataset_name": "VibrantVista/gutenberg-chunks",
-        "push_to_hub": True,
-    }
+    # METADATA = "../data/cleaned_metadata.json"
+    DATA_DIR = "../data"
+    METADATA = "../data/grpo_target_books.json"
+    OUTPUT_DIR = "../data/target_books"
+    # OUTPUT_DIR = "../data/benchmark_test_dataset_hf"
 
-    dataset = builder.build_dataset(**config)
+    builder = DatasetBuilder()
+    builder.build(METADATA, DATA_DIR, OUTPUT_DIR)
