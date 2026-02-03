@@ -35,31 +35,33 @@ This project uses the following datasets available on HuggingFace:
   - Prompts and style references for the Reinforcement Learning stage.
 
 ## 📁 Project Structure
+```text
 literary_style_model/
-├── config/ # Configuration files
-│ ├── ds_config_fsdp.json # DeepSpeed Zero3 config for multi-GPU
-│ └── fsdp_config.yaml # Accelerate FSDP config for multi-GPU
+├── config/                        # Configuration files
+│   ├── ds_config_fsdp.json        # DeepSpeed Zero3 config for multi-GPU
+│   └── fsdp_config.yaml           # Accelerate FSDP config for multi-GPU
 ├── docker.def
 ├── LICENSE
 ├── pyproject.toml
 ├── README.md
-├── data/ # Sample data files
-├── data_analysis/ # Analysis and evaluation tools
-│ ├── chunk_book.py
-│ └── Unified_analysis.py
-├── data_processing/ # Dataset creation and processing
-│ ├── export_dataset_to_json.py
-│ ├── GRPO_dataset_builder.py
-│ ├── gutenberg_download.py
-│ ├── prompts.py
-│ ├── SFT_dataset_builder.py
-│ ├── upload_triplet_dataset.py
-│ └── Style_evaluation.py
-│
-└── Train/ # Training scripts and utilities
-  ├── Multi_GRPOTrainer.py # Multi-reward GRPO training
-  ├── sentence_trainer.py # Sentence transformer training
-  └── SFTTrainer.py # Supervised fine-tuning
+├── data/                          # Sample data files
+├── data_analysis/                 # Analysis and evaluation tools
+│   ├── benchmark_ds.py            # Dataset benchmarking building file
+│   ├── chunk_book.py
+│   └── Unified_analysis.py
+├── data_processing/               # Dataset creation and processing
+│   ├── export_dataset_to_json.py
+│   ├── GRPO_dataset_builder.py
+│   ├── gutenberg_download.py
+│   ├── prompts.py
+│   ├── SFT_dataset_builder.py
+│   ├── upload_triplet_dataset.py
+│   └── Style_evaluation.py
+└── Train/                         # Training scripts and utilities
+    ├── Multi_GRPOTrainer.py       # Multi-reward GRPO training
+    ├── sentence_trainer.py        # Sentence transformer training
+    └── SFTTrainer.py              # Supervised fine-tuning
+```
 
 
 ## 🚀 Quick Start
@@ -81,7 +83,8 @@ git clone <repository-url>
 cd literary_style_model
 ```
 2. Install dependencies:
-```uv sync
+```bash
+uv sync
 ```
 or building Apptainer image:
 ```bash
