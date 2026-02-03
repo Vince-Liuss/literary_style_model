@@ -94,11 +94,7 @@ apptainer build literary_style_model.sif docker.def
 Stage 1: Train Sentence Transformer Reward Model
 Train a sentence transformer to evaluate style similarity using the judge dataset:
 ```bash
-torchrun --nnodes=1 --nproc_per_node=4 Cross_DDP_trainer.py \
-        --model_name "model_you_want" \
-        --batch_size 16 \
-        --grad_accum 1 \
-        --trust_remote
+torchrun --nnodes=1 --nproc_per_node=4 Cross_DDP_trainer.py 
 ```   
 Stage 2: Supervised Fine-Tuning (SFT)
 Train the base language model using distributed training with accelerate and FSDP. Run the following command:
