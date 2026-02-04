@@ -94,7 +94,7 @@ apptainer build literary_style_model.sif docker.def
 Stage 1: Train Sentence Transformer Reward Model
 Train a sentence transformer to evaluate style similarity using the judge dataset:
 ```bash
-torchrun --nnodes=1 --nproc_per_node=4 Cross_DDP_trainer.py 
+torchrun --nnodes=1 --nproc_per_node=4 sentence_trainer.py 
 ```   
 Stage 2: Supervised Fine-Tuning (SFT)
 Train the base language model using distributed training with accelerate and FSDP. Run the following command:
@@ -110,6 +110,7 @@ accelerate launch --config_file config/fsdp_config.yaml Train/SFTTrainer_multiGP
     --use_wandb True
 ```
 Stage 3: GRPO (Group Relative Policy Optimization)
+Need set up `Accelerate` package with ds_config.json.
 The GRPO stage requires a two-step process: hosting the reward model judge via vLLM and then running the training script.
 
 ### 1. Start the Reward Model Server (vLLM)
