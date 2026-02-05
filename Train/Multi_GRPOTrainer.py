@@ -210,14 +210,13 @@ def train_with_grpo(args: ScriptArguments):
     reward_manager = RewardManager(args, device)
     reward_manager.load_models()
 
-    clean_name = args.author_name.replace(", ", "_").replace("'", "")
-    folder_name = f"{clean_name}-{args.beta}"
+    folder_name = f"{args.author_name}-{args.beta}"
     args.output_dir = os.path.join(args.output_dir, folder_name)
     if args.log_wandb:
         if distributed_state.is_main_process:
             wandb.init(
                 project="author-style-agent",
-                name=f"{clean_name}-{args.beta}",
+                name=f"{args.author_name}-{args.beta}",
                 config=vars(args),
             )
 
