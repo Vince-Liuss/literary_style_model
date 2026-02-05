@@ -38,29 +38,35 @@ This project uses the following datasets available on HuggingFace:
 ```text
 literary_style_model/
 ├── config/                        # Configuration files
-│   ├── ds_config_fsdp.json        # DeepSpeed Zero3 config for multi-GPU
+│   ├── ds_config.json             # DeepSpeed Zero3 config for multi-GPU
 │   └── fsdp_config.yaml           # Accelerate FSDP config for multi-GPU
 ├── docker.def
 ├── LICENSE
 ├── pyproject.toml
 ├── README.md
+├── .gitignore
+├── .python-version
 ├── data/                          # Sample data files
 ├── data_analysis/                 # Analysis and evaluation tools
+│   ├── __init__.py
+│   ├── benchmark.py
 │   ├── benchmark_ds.py            # Dataset benchmarking building file
 │   ├── chunk_book.py
-│   └── Unified_analysis.py
 ├── data_processing/               # Dataset creation and processing
+│   ├── __init__.py
 │   ├── export_dataset_to_json.py
 │   ├── GRPO_dataset_builder.py
 │   ├── gutenberg_download.py
 │   ├── prompts.py
 │   ├── SFT_dataset_builder.py
-│   ├── upload_triplet_dataset.py
-│   └── Style_evaluation.py
+│   ├── Style_evaluation.py
+│   └── upload_triplet_dataset.py
 └── Train/                         # Training scripts and utilities
+    ├── __init__.py
     ├── Multi_GRPOTrainer.py       # Multi-reward GRPO training
     ├── sentence_trainer.py        # Sentence transformer training
-    └── SFTTrainer.py              # Supervised fine-tuning
+    ├── SFTTrainer.py              # Supervised fine-tuning
+    └── utils.py
 ```
 
 
