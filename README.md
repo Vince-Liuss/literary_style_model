@@ -97,12 +97,12 @@ or building Apptainer image:
 apptainer build literary_style_model.sif docker.def
 ``` 
 ## 📚 Usage Guide
-Stage 1: Train Sentence Transformer Reward Model
+### Stage 1: Train Sentence Transformer Reward Model
 Train a sentence transformer to evaluate style similarity using the judge dataset:
 ```bash
 torchrun --nnodes=1 --nproc_per_node=4 Train/sentence_trainer.py 
 ```   
-Stage 2: Supervised Fine-Tuning (SFT)
+### Stage 2: Supervised Fine-Tuning (SFT)
 Train the base language model using distributed training with accelerate and FSDP. Run the following command:
 ```bash
 accelerate launch --config_file config/fsdp_config.yaml Train/SFTTrainer.py \
@@ -115,11 +115,11 @@ accelerate launch --config_file config/fsdp_config.yaml Train/SFTTrainer.py \
     --epochs 1 \
     --use_wandb True
 ```
-Stage 3: GRPO (Group Relative Policy Optimization)
+### Stage 3: GRPO (Group Relative Policy Optimization)
 Run `accelerate config` once to set up with `config/ds_config.json`.
 This stage has two steps: start the reward-model judge with vLLM, then run the training script.
 
-### 1. Start the Reward Model Server (vLLM)
+#### 1. Start the Reward Model Server (vLLM)
 Open a terminal and start the OpenChat server which serves as the "Judge" for content quality and coherence.
 ```bash
 vllm serve openchat/openchat-3.5-0106 \
@@ -131,7 +131,7 @@ vllm serve openchat/openchat-3.5-0106 \
   --trust-remote-code \
   --async-scheduling
 ```
-### 2. Run GRPO Training
+#### 2. Run GRPO Training
 In a separate terminal, launch the GRPO trainer. This connects to the vLLM server to score generations.
 ```bash
 accelerate launch Train/Multi_GRPOTrainer.py \
@@ -153,10 +153,8 @@ accelerate launch Train/Multi_GRPOTrainer.py \
     --scale_rewards "batch"
 ```
 ## 🙏 Acknowledgments
+We are deeply grateful to the manager of the University of Birmingham’s Baskerville HPC system for providing the computational resources that made this research possible.
 Project Gutenberg for providing classic literature texts.
-Hugging Face for model hosting and datasets.
-TRL library for GRPO implementation.
-Sentence Transformers library for embedding models.
 
 ## 📄 License
 MIT License
