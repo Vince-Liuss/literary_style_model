@@ -85,7 +85,7 @@ literary_style_model/
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/Vince-Liuss/literary_style_model.git
 cd literary_style_model
 ```
 2. Install dependencies:
